@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vista-arc3"
+version = "0.1.0"
+description = "VISTA visual agent interface for ARC-AGI-3"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [
+  { name = "Qiushi Han" },
+  { name = "Keya Hu" },
+  { name = "Linlu Qiu" },
+  { name = "Cathy Wu" },
+  { name = "Kaiming He" },
+]
+dependencies = [
+  "arc-agi==0.9.9",
+  "arcengine==0.9.3",
+  "numpy==2.5.1",
+  "pillow==12.2.0",
+  "python-dotenv==1.2.2",
+  "requests==2.34.2",
+  "urllib3==2.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+  "ruff==0.16.3",
+]
+
+[project.scripts]
+vista-codex = "vista_arc3.codex.harness:main"
+vista-claude = "vista_arc3.claude.harness:main"
+
+[project.urls]
+Homepage = "https://vista-research.github.io/"
+
+[tool.setuptools.package-data]
+vista_arc3 = ["codex/*.md", "claude/*.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/vista_arc3/claude/*.py" = ["I001"]
+"src/vista_arc3/codex/*.py" = ["I001"]
+"src/vista_arc3/shared/*.py" = ["I001"]
+"src/vista_arc3/claude/controller.py" = ["F401"]
+"src/vista_arc3/claude/harness.py" = ["F401"]
+"src/vista_arc3/codex/controller.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true

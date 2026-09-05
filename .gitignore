@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+.claude/
+.codex/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# VISTA run artifacts. These can include raw grids, model transcripts,
+# scorecard ids, and local Codex session state.
+runs/
+run_logs/
+recordings/
+environment_files/
+experiments/
+
+# Local editor/system files.
+.DS_Store
