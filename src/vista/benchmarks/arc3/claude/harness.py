@@ -337,6 +337,8 @@ def run_game(
         claude_bin = validate_claude_runtime(
             default_claude_bin(),
             oauth_token=oauth_token,
+            provider=provider,
+            provider_credential=provider_credential,
         )
         if preflight_model_id is None:
             _, concrete_model_id = run_runtime_preflight(
