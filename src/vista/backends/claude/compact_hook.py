@@ -38,6 +38,7 @@ def main() -> int:
         os.environ.get(name)
         for name in (
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "ARC_API_KEY",
         )

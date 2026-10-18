@@ -23,13 +23,18 @@ from vista.backends.claude.lifecycle import (
     PROVIDER_5XX_BACKOFF_SECONDS as PROVIDER_5XX_BACKOFF_SECONDS,
     run_task_with_native_context as run_task_with_native_context,
 )
+from vista.backends.claude.provider import (
+    ANTHROPIC_PROVIDER,
+    DEEPSEEK_PROVIDER,
+    ClaudeCodeProvider,
+)
 from vista.backends.claude.quota import ClaudeCredentialLease, ClaudeRateLimitEvent
 from vista.benchmarks.arc3.claude.controller import GameController, write_json
 from vista.benchmarks.arc3.claude.recovery import TASK_OBJECTIVE
 from vista.benchmarks.arc3.claude.runner import (
+    CLAUDE_AUTO_COMPACT_WINDOW,
     CLAUDE_EFFORT_LEVELS,
     DEFAULT_CLAUDE_EFFORT,
-    DEFAULT_CLAUDE_MODEL,
     PINNED_CLAUDE_VERSION,
     RUNTIME_PREFLIGHT_PROMPT,
     ClaudeCodeRunner,
@@ -62,6 +67,10 @@ DISPLAY_SIZE = GRID_SIZE * RENDER_SCALE
 DEFAULT_MAX_STEPS = 2_000
 DEFAULT_MAX_INVALID_RETRIES = 15
 EMPTY_GUIDE_MODEL = "No reliable model yet."
+PROVIDERS = {
+    ANTHROPIC_PROVIDER.name: ANTHROPIC_PROVIDER,
+    DEEPSEEK_PROVIDER.name: DEEPSEEK_PROVIDER,
+}
 COMPACT_RESTORE_MARKER = Path("compact_restore.pending")
 COMPACT_GUIDE_SNAPSHOT = Path("compact_guide.snapshot")
 COMPACT_CHECKPOINT_MARKER = Path("compact_checkpoint.requested")
@@ -137,15 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--operation-mode", choices=["online", "offline"], default="online"
     )
     parser.add_argument(
+        "--provider",
+        choices=("auto", *PROVIDERS),
+        default=None,
+        help="Model provider (default: auto-detect from the environment)",
+    )
+    parser.add_argument(
         "--model",
-        default=DEFAULT_CLAUDE_MODEL,
-        help="Claude model alias or full model ID",
+        default=None,
+        help="Model alias or full model ID (default: provider default)",
     )
     parser.add_argument(
         "--effort",
         choices=CLAUDE_EFFORT_LEVELS,
-        default=DEFAULT_CLAUDE_EFFORT,
-        help="Claude adaptive reasoning effort",
+        default=None,
+        help="Reasoning effort (default: provider default)",
     )
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument(
@@ -161,16 +176,58 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_provider(
+    args: argparse.Namespace,
+) -> tuple[ClaudeCodeProvider, str, str | None, str, str]:
+    name = (
+        getattr(args, "provider", None)
+        or os.getenv("VISTA_CLAUDE_PROVIDER")
+        or "auto"
+    ).strip().lower()
+    if name == "auto":
+        if os.getenv("ANTHROPIC_BASE_URL") and os.getenv("ANTHROPIC_AUTH_TOKEN"):
+            name = DEEPSEEK_PROVIDER.name
+        else:
+            name = ANTHROPIC_PROVIDER.name
+    provider = PROVIDERS.get(name)
+    if provider is None:
+        raise ValueError(f"Unknown Claude provider {name!r}")
+    model = getattr(args, "model", None) or provider.default_model
+    if not provider.supports_model(model):
+        raise ValueError(f"Unsupported {provider.name} model: {model}")
+    effort = (
+        getattr(args, "effort", None)
+        or provider.default_effort
+        or DEFAULT_CLAUDE_EFFORT
+    )
+    credential = os.getenv(provider.credential_env)
+    if not credential:
+        raise RuntimeError(
+            f"{provider.credential_env} is not set for the {provider.name} provider."
+        )
+    base_url = None
+    if not provider.native:
+        base_url = os.getenv("ANTHROPIC_BASE_URL") or provider.default_base_url
+        if not base_url:
+            raise RuntimeError(
+                f"The {provider.name} provider requires an Anthropic-compatible "
+                "base URL."
+            )
+    return provider, credential, base_url, model, effort
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     load_run_environment()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.operation_mode != "offline" and not os.getenv("ARC_API_KEY"):
         parser.error("ARC_API_KEY is not set. Put it in .env or export it.")
-    if not os.getenv("CLAUDE_CODE_OAUTH_TOKEN"):
-        parser.error(
-            "CLAUDE_CODE_OAUTH_TOKEN is not set. Run `claude setup-token` and export it."
-        )
+    try:
+        _, _, _, model, effort = resolve_provider(args)
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    args.model = model
+    args.effort = effort
     if args.max_steps < 1:
         parser.error("--max-steps must be >= 1")
     if args.timeout < 1:
@@ -207,10 +264,29 @@ def run_game(
         )
 
     args = argparse.Namespace(**vars(args))
+    provider, resolved_credential, provider_base_url, model, effort = resolve_provider(
+        args
+    )
+    args.model = model
+    args.effort = effort
+    if provider.native:
+        provider_credential = None
+    else:
+        provider_credential = resolved_credential
+        if credential_lease is not None:
+            raise ValueError(
+                "Claude credential leases are only defined for the Anthropic provider"
+            )
+        if oauth_token is not None:
+            raise ValueError(
+                "oauth_token is only defined for the Anthropic provider"
+            )
     if credential_lease is not None:
         if oauth_token is not None and oauth_token != credential_lease.oauth_token:
             raise ValueError("Claude credential lease and OAuth token do not match")
         oauth_token = credential_lease.oauth_token
+    elif provider.native and oauth_token is None:
+        oauth_token = resolved_credential
     if run_dir is None:
         run_dir = create_run_dir(getattr(args, "runs_dir", Path("runs")))
     else:
@@ -267,6 +343,9 @@ def run_game(
                 effort=args.effort,
                 timeout=args.timeout,
                 oauth_token=oauth_token,
+                provider=provider,
+                provider_credential=provider_credential,
+                provider_base_url=provider_base_url,
             )
         else:
             concrete_model_id = preflight_model_id
@@ -339,6 +418,14 @@ def run_game(
             effort=args.effort,
             expected_model_id=concrete_model_id,
             oauth_token=oauth_token,
+            provider=provider,
+            provider_credential=provider_credential,
+            provider_base_url=provider_base_url,
+            auto_compact_window=(
+                provider.auto_compact_window
+                if provider.auto_compact_window is not None
+                else CLAUDE_AUTO_COMPACT_WINDOW
+            ),
             task_timeout=bounded_task_timeout(args.timeout, maximum_calls),
             display_size=DISPLAY_SIZE,
             rate_limit_observer=(
@@ -449,6 +536,9 @@ def run_runtime_preflight(
     timeout: int,
     oauth_token: str | None = None,
     rate_limit_observer: Callable[[ClaudeRateLimitEvent], None] | None = None,
+    provider: ClaudeCodeProvider = ANTHROPIC_PROVIDER,
+    provider_credential: str | None = None,
+    provider_base_url: str | None = None,
 ) -> tuple[ClaudeResult, str]:
     runner = ClaudeCodeRunner(
         visible_dir=visible_dir,
@@ -459,6 +549,14 @@ def run_runtime_preflight(
         model=model,
         effort=effort,
         oauth_token=oauth_token,
+        provider=provider,
+        provider_credential=provider_credential,
+        provider_base_url=provider_base_url,
+        auto_compact_window=(
+            provider.auto_compact_window
+            if provider.auto_compact_window is not None
+            else CLAUDE_AUTO_COMPACT_WINDOW
+        ),
         task_timeout=max(60, timeout),
         display_size=DISPLAY_SIZE,
         rate_limit_observer=rate_limit_observer,

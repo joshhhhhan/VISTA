@@ -21,6 +21,7 @@ class ClaudeCodeProvider:
     default_model: str
     default_context_window: int
     default_base_url: str | None = None
+    default_effort: str | None = None
     model_context_windows: tuple[tuple[str, int], ...] = ()
     # None leaves the transport's default unchanged.
     auto_compact_window: int | None = None
@@ -52,6 +53,17 @@ ANTHROPIC_PROVIDER = ClaudeCodeProvider(
     endpoint_protocol="anthropic-native",
     default_model="opus",
     default_context_window=1_000_000,
+)
+
+DEEPSEEK_PROVIDER = ClaudeCodeProvider(
+    name="deepseek",
+    credential_env="ANTHROPIC_AUTH_TOKEN",
+    endpoint_protocol="anthropic-compatible",
+    default_model="deepseek-flash[1m]",
+    default_context_window=786_432,
+    default_base_url="https://api.deepseek.com/anthropic",
+    default_effort="max",
+    auto_compact_window=786_432,
 )
 
 # Removed before applying provider settings. Model aliases are also cleared
