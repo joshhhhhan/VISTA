@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import secrets
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -293,6 +294,7 @@ class ClaudeCodeRunner:
         oauth_token: str | None = None,
         task_timeout: int = 3600,
         image: str = PLAYER_IMAGE,
+        host_runtime: bool | None = None,
         display_size: int = 512,
         auto_compact_window: int | None = CLAUDE_AUTO_COMPACT_WINDOW,
         auto_compact_percent: int | None = CLAUDE_AUTO_COMPACT_PERCENT,
@@ -394,6 +396,14 @@ class ClaudeCodeRunner:
             raise ValueError("The decision lease timeout must be positive.")
         self.decision_lease_timeout = decision_lease_timeout
         self.image = image
+        self.host_runtime = (
+            host_runtime
+            if host_runtime is not None
+            else os.getenv("VISTA_CLAUDE_HOST_RUNTIME", "").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        self.host_home = self.io_dir / "host_home"
+        self.host_workspace = self.io_dir / "host_workspace"
         self.display_size = display_size
         if (auto_compact_window is None) != (auto_compact_percent is None):
             raise ValueError("Both auto-compact settings must be provided together.")
@@ -411,6 +421,9 @@ class ClaudeCodeRunner:
         self._segment_index = 0
         self._session_image_blocks: dict[str, int] = {}
         self.io_dir.mkdir(parents=True, exist_ok=True)
+        if self.host_runtime:
+            self.host_home.mkdir(mode=0o700, exist_ok=True)
+            self.host_workspace.mkdir(mode=0o700, exist_ok=True)
         for path in (
             self.guide_path,
             self.agents_path,
@@ -445,13 +458,50 @@ class ClaudeCodeRunner:
 
     def _process_environment(self) -> dict[str, str]:
         if self.provider.native:
-            return claude_process_environment(self.oauth_token)
-        return provider_process_environment(self.provider_environment)
+            environment = claude_process_environment(self.oauth_token)
+        else:
+            environment = provider_process_environment(self.provider_environment)
+        if self.host_runtime:
+            environment.update(self._host_runtime_environment())
+        return environment
+
+    def _host_runtime_environment(self) -> dict[str, str]:
+        environment = {
+            "HOME": str(self.host_home),
+            "CLAUDE_CONFIG_DIR": str(self.claude_config_dir),
+            "TERM": "dumb",
+            "NO_COLOR": "1",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+            "CLAUDE_CODE_DISABLE_CRON": "1",
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_AUTO_CONNECT_IDE": "false",
+            "MAX_MCP_OUTPUT_TOKENS": str(MAX_MCP_OUTPUT_TOKENS),
+            "SSL_CERT_FILE": str(self.ca_bundle),
+        }
+        if self.auto_compact_window is not None:
+            environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(
+                self.auto_compact_window
+            )
+        if self.auto_compact_percent is not None:
+            environment["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(
+                self.auto_compact_percent
+            )
+        if self.max_output_tokens is not None:
+            environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(
+                self.max_output_tokens
+            )
+        if self.mcp_tool_timeout_ms is not None:
+            environment["MCP_TOOL_TIMEOUT"] = str(self.mcp_tool_timeout_ms)
+        return environment
 
     def _container_name(self, session_id: str) -> str | None:
         # Name containers for compatible providers so they can be removed
         # explicitly when the client process is terminated.
-        if self.provider.native:
+        if self.host_runtime or self.provider.native:
             return None
         return f"arc3-{session_id}"
 
@@ -592,19 +642,28 @@ class ClaudeCodeRunner:
         bridge_token = secrets.token_urlsafe(32)
         mcp_config_path = self.claude_config_dir / f"{stem}.mcp.json"
         settings_path = self.claude_config_dir / f"{stem}.settings.json"
-        self._write_mcp_config(mcp_config_path, bridge_token)
-        self._write_settings(settings_path, compact_events_path.name)
         socket_dir = create_short_socket_dir(segment)
         socket_path = socket_dir / "controller.sock"
+        self._write_mcp_config(mcp_config_path, bridge_token, socket_path)
+        self._write_settings(settings_path, compact_events_path.name)
 
-        command = self._docker_command(
-            mcp_config_path=mcp_config_path,
-            settings_path=settings_path,
-            socket_dir=socket_dir,
-            session_id=requested_session_id,
-            resume=resume_session_id is not None,
-            disable_slash_commands=disable_slash_commands,
-        )
+        if self.host_runtime:
+            command = self._host_command(
+                mcp_config_path=mcp_config_path,
+                settings_path=settings_path,
+                session_id=requested_session_id,
+                resume=resume_session_id is not None,
+                disable_slash_commands=disable_slash_commands,
+            )
+        else:
+            command = self._docker_command(
+                mcp_config_path=mcp_config_path,
+                settings_path=settings_path,
+                socket_dir=socket_dir,
+                session_id=requested_session_id,
+                resume=resume_session_id is not None,
+                disable_slash_commands=disable_slash_commands,
+            )
         command_path.write_text(json.dumps(command, indent=2), encoding="utf-8")
         input_message = stream_user_message(prompt, initial_images)
         if ordered_input is not None:
@@ -651,7 +710,7 @@ class ClaudeCodeRunner:
             host.start()
             process = subprocess.Popen(
                 command,
-                cwd=self.visible_dir,
+                cwd=self.host_workspace if self.host_runtime else self.visible_dir,
                 env=self._process_environment(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -1007,7 +1066,18 @@ class ClaudeCodeRunner:
             rate_limit_events=tuple(rate_limit_events),
         )
 
-    def _write_mcp_config(self, path: Path, token: str) -> None:
+    def _write_mcp_config(
+        self,
+        path: Path,
+        token: str,
+        socket_path: Path,
+    ) -> None:
+        if self.host_runtime:
+            bridge = str(Path(__file__).with_name("mcp_bridge.py").resolve())
+            socket = str(socket_path)
+        else:
+            bridge = CONTAINER_MCP_BRIDGE
+            socket = "/run/arc3-game/controller.sock"
         path.write_text(
             json.dumps(
                 {
@@ -1022,10 +1092,10 @@ class ClaudeCodeRunner:
                                     for argument in ("-u", name)
                                 ),
                                 "python3",
-                                CONTAINER_MCP_BRIDGE,
+                                bridge,
                             ],
                             "env": {
-                                "ARC3_GAME_SOCKET": "/run/arc3-game/controller.sock",
+                                "ARC3_GAME_SOCKET": socket,
                                 "ARC3_GAME_TOKEN": token,
                             },
                         }
@@ -1049,9 +1119,19 @@ class ClaudeCodeRunner:
             path.chmod(0o600)
             return
         unset_credentials = " ".join(f"-u {name}" for name in CREDENTIAL_ENV_NAMES)
-        hook_environment = [
-            f"ARC3_COMPACT_EVENT_LOG=/claude-io/{compact_event_log_name}"
-        ]
+        if self.host_runtime:
+            hook_environment = [
+                "ARC3_COMPACT_EVENT_LOG="
+                + shlex.quote(str(self.io_dir / compact_event_log_name))
+            ]
+            hook_path = shlex.quote(
+                str(Path(__file__).with_name("compact_hook.py").resolve())
+            )
+        else:
+            hook_environment = [
+                f"ARC3_COMPACT_EVENT_LOG=/claude-io/{compact_event_log_name}"
+            ]
+            hook_path = CONTAINER_COMPACT_HOOK
         marker_environment = (
             (
                 "ARC3_COMPACT_CHECKPOINT_REQUEST",
@@ -1064,15 +1144,18 @@ class ClaudeCodeRunner:
         )
         for name, marker in marker_environment:
             if marker is not None:
-                hook_environment.append(
-                    f"{name}={self._container_io_path(Path(marker))}"
+                value = (
+                    shlex.quote(str(Path(marker)))
+                    if self.host_runtime
+                    else self._container_io_path(Path(marker))
                 )
+                hook_environment.append(f"{name}={value}")
         hook = {
             "type": "command",
             "command": (
                 f"/usr/bin/env {unset_credentials} "
                 f"{' '.join(hook_environment)} "
-                f"python3 {CONTAINER_COMPACT_HOOK}"
+                f"python3 {hook_path}"
             ),
             "timeout": 10,
         }
@@ -1212,6 +1295,58 @@ class ClaudeCodeRunner:
             f"/claude-config/{settings_path.name}",
             "--mcp-config",
             f"/claude-config/{mcp_config_path.name}",
+            "--strict-mcp-config",
+            "--tools",
+            "",
+            "--allowedTools",
+            allowed_tools,
+            "--permission-mode",
+            CLAUDE_PERMISSION_MODE,
+            "--prompt-suggestions",
+            "false",
+            "--no-chrome",
+        ]
+        if disable_slash_commands:
+            command.append("--disable-slash-commands")
+        if resume:
+            command.extend(["--resume", session_id])
+        else:
+            command.extend(["--session-id", session_id])
+        return command
+
+    def _host_command(
+        self,
+        *,
+        mcp_config_path: Path,
+        settings_path: Path,
+        session_id: str,
+        resume: bool,
+        disable_slash_commands: bool = True,
+    ) -> list[str]:
+        allowed_tools = ",".join(
+            f"mcp__game__{tool['name']}" for tool in self._tool_definitions()
+        )
+        command = [
+            str(self.claude_bin),
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-hook-events",
+            "--model",
+            self.model,
+            "--effort",
+            self.effort,
+            "--system-prompt",
+            self.agents_instructions,
+            "--setting-sources",
+            "",
+            "--settings",
+            str(settings_path),
+            "--mcp-config",
+            str(mcp_config_path),
             "--strict-mcp-config",
             "--tools",
             "",
