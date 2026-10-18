@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -221,7 +222,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.operation_mode != "offline" and not os.getenv("ARC_API_KEY"):
-        parser.error("ARC_API_KEY is not set. Put it in .env or export it.")
+        print(
+            "ARC_API_KEY is not set; using the ARC anonymous API key.",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         _, _, _, model, effort = resolve_provider(args)
     except (RuntimeError, ValueError) as exc:
