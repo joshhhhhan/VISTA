@@ -397,7 +397,11 @@ class GameController(SessionController):
                     self._store_observation()
                 else:
                     self._current_images = []
-                if self.step_index >= self.max_steps and not self.terminal:
+                if (
+                    self.max_steps > 0
+                    and self.step_index >= self.max_steps
+                    and not self.terminal
+                ):
                     self.forced_termination_reason = "action_budget_exhausted"
                 level_boundary = self._crossed_level_boundary(previous_levels_completed)
                 if level_boundary:

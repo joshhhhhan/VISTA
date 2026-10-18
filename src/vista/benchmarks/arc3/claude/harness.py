@@ -142,7 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("runs"),
         help="Run output directory (default: ./runs in the current working directory)",
     )
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=DEFAULT_MAX_STEPS,
+        help="Action budget; 0 means no limit (run until the game ends)",
+    )
     parser.add_argument(
         "--operation-mode", choices=["online", "offline"], default="online"
     )
@@ -233,8 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     args.model = model
     args.effort = effort
-    if args.max_steps < 1:
-        parser.error("--max-steps must be >= 1")
+    if args.max_steps < 0:
+        parser.error("--max-steps must be >= 0; 0 means no limit")
     if args.timeout < 1:
         parser.error("--timeout must be >= 1")
     if args.max_invalid_retries < 0:
@@ -414,7 +419,11 @@ def run_game(
             agent_name="claude-code",
             interface_name="native-mcp-tool-loop",
         )
-        maximum_calls = args.max_steps * (args.max_invalid_retries + 1) + 1
+        maximum_calls = (
+            args.max_steps * (args.max_invalid_retries + 1) + 1
+            if args.max_steps > 0
+            else 1_000_000
+        )
         runner = ClaudeCodeRunner(
             visible_dir=visible_dir,
             claude_config_dir=config_dir,
