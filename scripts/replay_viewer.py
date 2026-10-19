@@ -12,6 +12,7 @@ touches the harness. Bind it to localhost on the run host and forward the port:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import time
@@ -36,21 +37,32 @@ def load_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def frames_dir_for(run_dir: Path) -> Path:
+    return next(
+        (run_dir / name for name in FRAME_DIRS if (run_dir / name).is_dir()),
+        run_dir / FRAME_DIRS[0],
+    )
+
+
 class RunArtifacts:
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, previous_run_dir: Path | None = None) -> None:
         self.run_dir = run_dir
-        self.frames_dir = next(
-            (run_dir / name for name in FRAME_DIRS if (run_dir / name).is_dir()),
-            run_dir / FRAME_DIRS[0],
-        )
+        self.frames_dir = frames_dir_for(run_dir)
         self.action_log = run_dir / ACTION_LOG
+        self.previous_run_dir = previous_run_dir
+        self.previous_frames_dir = (
+            frames_dir_for(previous_run_dir) if previous_run_dir is not None else None
+        )
+        self.previous_action_log = (
+            previous_run_dir / ACTION_LOG if previous_run_dir is not None else None
+        )
 
     def manifest(self) -> dict:
         return load_json(self.run_dir / "manifest.json")
 
-    def frames(self) -> list[dict]:
+    def _list_frames(self, frames_dir: Path, prefix: str) -> list[dict]:
         try:
-            entries = list(self.frames_dir.iterdir())
+            entries = list(frames_dir.iterdir())
         except OSError:
             return []
         frames = []
@@ -64,7 +76,7 @@ class RunArtifacts:
                 continue
             frames.append(
                 {
-                    "name": path.name,
+                    "name": f"{prefix}/{path.name}",
                     "turn": int(match.group(1)),
                     "frame": int(match.group(2)),
                     "mtime": stat.st_mtime,
@@ -74,10 +86,23 @@ class RunArtifacts:
         frames.sort(key=lambda item: (item["turn"], item["frame"]))
         return frames
 
-    def actions(self) -> list[dict]:
+    def frames(self) -> list[dict]:
+        current = self._list_frames(self.frames_dir, "cur")
+        if self.previous_run_dir is None:
+            return current
+        previous = self._list_frames(self.previous_frames_dir, "prev")
+        offset = max((item["turn"] for item in previous), default=0)
+        adjusted = [item for item in current if item["turn"] > 0]
+        for item in adjusted:
+            item["turn"] += offset
+        return sorted(previous + adjusted, key=lambda item: (item["turn"], item["frame"]))
+
+    def _actions(self, action_log: Path | None) -> list[dict]:
+        if action_log is None:
+            return []
         entries: list[dict] = []
         try:
-            with self.action_log.open(encoding="utf-8", errors="replace") as stream:
+            with action_log.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     line = line.strip()
                     if not line:
@@ -97,12 +122,53 @@ class RunArtifacts:
                 by_step[step] = entry
         return [by_step[step] for step in sorted(by_step)]
 
+    def actions(self) -> list[dict]:
+        current = self._actions(self.action_log)
+        if self.previous_run_dir is None:
+            return current
+        previous = self._actions(self.previous_action_log)
+        previous_frames = self._list_frames(self.previous_frames_dir, "prev")
+        offset = max((item["turn"] for item in previous_frames), default=0)
+        adjusted = []
+        for entry in current:
+            item = copy.deepcopy(entry)
+            if isinstance(item.get("step"), int):
+                item["step"] += offset
+            result = item.get("result")
+            if isinstance(result, dict) and isinstance(result.get("turn"), int):
+                result["turn"] += offset
+            adjusted.append(item)
+        return sorted(previous + adjusted, key=lambda item: item.get("step", -1))
+
     def snapshot(self) -> dict:
+        manifest = self.manifest()
+        frames = self.frames()
+        actions = self.actions()
+        if self.previous_run_dir is not None:
+            initial_progress = {"completed": 0, "total": 8}
+            merged_previous_frames = sum(
+                1 for item in frames if item["name"].startswith("prev/")
+            )
+        else:
+            source = manifest.get("resume_progress") or manifest.get("progress") or {}
+            if not isinstance(source, dict):
+                source = {}
+            initial_progress = {
+                "completed": source.get("completed", 0),
+                "total": source.get("total", 8),
+            }
+            merged_previous_frames = 0
         return {
             "run_dir": str(self.run_dir),
-            "manifest": self.manifest(),
-            "frames": self.frames(),
-            "actions": self.actions(),
+            "previous_run_dir": (
+                str(self.previous_run_dir) if self.previous_run_dir is not None else None
+            ),
+            "manifest": manifest,
+            "frames": frames,
+            "actions": actions,
+            "initial_progress": initial_progress,
+            "merged": self.previous_run_dir is not None,
+            "merged_previous_frames": merged_previous_frames,
             "server_time": time.time(),
         }
 
@@ -286,27 +352,33 @@ function renderHeader() {
   const rows = [
     ['run', m.game_id], ['runtime', m.runtime], ['model', m.requested_model],
     ['effort', m.reasoning_effort], ['mode', m.operation_mode],
-    ['scorecard', m.scorecard_id], ['steps', m.steps_attempted],
-    ['frames', snap.frames.length], ['run dir', snap.run_dir],
+    ['scorecard', m.scorecard_id],
+    ['steps', snap.merged ? snap.actions.length : m.steps_attempted],
+    ['frames', snap.frames.length],
+    ['previous', snap.merged ? `${snap.merged_previous_frames} frames` : null],
+    ['run dir', snap.run_dir],
   ].filter(([, value]) => value !== undefined && value !== null && value !== '');
   $('run-kv').innerHTML = rows.map(([key, value]) =>
     `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('');
 }
 
-function currentProgress() {
-  const m = snap.manifest || {};
-  const fallback = m.resume_progress || m.progress || { completed: 0, total: 8 };
-  const frame = currentFrame();
+function progressForFrame(frame) {
+  const fallback = snap.initial_progress || { completed: 0, total: 8 };
   if (!frame) return fallback;
-  const entry = actionForTurn(frame.turn);
-  const result = entry && entry.result;
-  const progress = result && result.progress;
-  if (progress && typeof progress.completed === 'number') return progress;
-  return fallback;
+  let best = null;
+  for (const entry of snap.actions) {
+    const result = entry && entry.result;
+    const turn = result && result.turn;
+    if (typeof turn === 'number' && turn <= frame.turn) {
+      const progress = result.progress;
+      if (progress && typeof progress.completed === 'number') best = progress;
+    }
+  }
+  return best || fallback;
 }
 
 function renderProgress() {
-  const progress = currentProgress();
+  const progress = progressForFrame(currentFrame());
   const total = Number(progress.total) || 8;
   const completed = Math.max(0, Math.min(total, Number(progress.completed) || 0));
   $('progress-count').textContent = `${completed} / ${total}`;
@@ -324,6 +396,9 @@ function renderProgress() {
   const notes = [];
   if (completed >= total) notes.push('all levels complete');
   else notes.push(`level ${completed + 1} in progress`);
+  if (snap.merged) {
+    notes.push(`restored ${snap.merged_previous_frames} previous frames`);
+  }
   const resumed = m.resume_progress || {};
   if (m.resume_from_run && typeof resumed.completed === 'number') {
     notes.push(`resumed at ${resumed.completed}/${resumed.total || total}`);
@@ -522,10 +597,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b"not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
 
     def _frame(self, name: str) -> None:
-        if not FRAME_NAME.match(name):
+        source = "cur"
+        if name.startswith("prev/"):
+            source = "prev"
+            name = name.removeprefix("prev/")
+        elif name.startswith("cur/"):
+            name = name.removeprefix("cur/")
+        basename = Path(name).name
+        if not FRAME_NAME.match(basename):
             self._send(b"not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
             return
-        path = self.artifacts.frames_dir / name
+        frames_dir = (
+            self.artifacts.previous_frames_dir
+            if source == "prev"
+            else self.artifacts.frames_dir
+        )
+        if frames_dir is None:
+            self._send(b"not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
+            return
+        path = frames_dir / basename
         try:
             body = path.read_bytes()
         except OSError:
@@ -555,6 +645,11 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument(
+        "--previous-run",
+        type=Path,
+        help="Earlier run to merge before the current run's frames and actions",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -562,7 +657,12 @@ def main() -> int:
     run_dir = args.run_dir.expanduser().resolve()
     if not run_dir.is_dir():
         parser.error(f"not a directory: {run_dir}")
-    Handler.artifacts = RunArtifacts(run_dir)
+    previous_run = None
+    if args.previous_run is not None:
+        previous_run = args.previous_run.expanduser().resolve()
+        if not previous_run.is_dir():
+            parser.error(f"not a directory: {previous_run}")
+    Handler.artifacts = RunArtifacts(run_dir, previous_run)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Serving {run_dir}")
     print(f"Open http://{args.host}:{args.port}/")
