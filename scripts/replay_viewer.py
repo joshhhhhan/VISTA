@@ -164,6 +164,21 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
   border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .badge.live { border-color: var(--accent); color: var(--accent); }
+.progress-wrap { display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.progress-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.progress-head .label { color: var(--muted); text-transform: uppercase;
+  letter-spacing: .08em; font-size: 12px; }
+.progress-head b { color: var(--accent); font-size: 18px; }
+.progress-head .note { color: var(--muted); font-size: 12px; }
+.progress-track { display: grid; gap: 4px; }
+.progress-cell { height: 12px; border: 1px solid var(--line);
+  border-radius: 3px; background: #1d2328; }
+.progress-cell.done { background: var(--accent); border-color: var(--accent); }
+.progress-cell.current { border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset; }
+.progress-scale { display: flex; justify-content: space-between;
+  color: var(--muted); font-size: 11px; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
 </style>
 </head>
@@ -175,6 +190,15 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   <span class="meta" id="h-mode"></span>
   <span class="badge" id="h-status">connecting</span>
 </header>
+<div class="progress-wrap">
+  <div class="progress-head">
+    <span class="label">Levels completed</span>
+    <b id="progress-count">0 / 8</b>
+    <span class="note" id="progress-note">waiting for data</span>
+  </div>
+  <div class="progress-track" id="progress-track"></div>
+  <div class="progress-scale"><span>0</span><span id="progress-total">8</span></div>
+</div>
 <main>
   <section class="stage">
     <div class="frame"><div class="empty" id="empty">Waiting for the first frame…</div><img id="img" alt="game frame"></div>
@@ -269,6 +293,46 @@ function renderHeader() {
     `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('');
 }
 
+function currentProgress() {
+  const m = snap.manifest || {};
+  const fallback = m.resume_progress || m.progress || { completed: 0, total: 8 };
+  const frame = currentFrame();
+  if (!frame) return fallback;
+  const entry = actionForTurn(frame.turn);
+  const result = entry && entry.result;
+  const progress = result && result.progress;
+  if (progress && typeof progress.completed === 'number') return progress;
+  return fallback;
+}
+
+function renderProgress() {
+  const progress = currentProgress();
+  const total = Number(progress.total) || 8;
+  const completed = Math.max(0, Math.min(total, Number(progress.completed) || 0));
+  $('progress-count').textContent = `${completed} / ${total}`;
+  $('progress-total').textContent = String(total);
+  $('progress-track').style.gridTemplateColumns = `repeat(${total}, 1fr)`;
+  const cells = [];
+  for (let level = 1; level <= total; level += 1) {
+    let cls = 'progress-cell';
+    if (level <= completed) cls += ' done';
+    else if (level === completed + 1) cls += ' current';
+    cells.push(`<div class="${cls}" title="Level ${level}"></div>`);
+  }
+  $('progress-track').innerHTML = cells.join('');
+  const m = snap.manifest || {};
+  const notes = [];
+  if (completed >= total) notes.push('all levels complete');
+  else notes.push(`level ${completed + 1} in progress`);
+  const resumed = m.resume_progress || {};
+  if (m.resume_from_run && typeof resumed.completed === 'number') {
+    notes.push(`resumed at ${resumed.completed}/${resumed.total || total}`);
+  } else if (m.resume_from_run) {
+    notes.push('resumed from previous run');
+  }
+  $('progress-note').textContent = notes.join(' · ');
+}
+
 let imageKey = null;
 
 function renderFrame() {
@@ -300,6 +364,7 @@ function renderFrame() {
   $('follow').className = follow ? 'on' : '';
   renderAction();
   renderList();
+  renderProgress();
 }
 
 function renderAction() {
