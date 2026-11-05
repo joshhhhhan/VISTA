@@ -41,6 +41,8 @@ VISTA runs on Linux x86_64 with Python 3.12, Docker Engine, and either
 Codex CLI 0.145.0 or Claude Code 2.1.220. ARC-AGI-3 batch runs also require `tmux`.
 Online and competition ARC-AGI-3 runs require an API key.
 
+Our local setup uses Ubuntu 22.04.5 LTS, Python 3.12.8 and Docker Engine 29.1.3.
+
 From a repository checkout, install the Python package:
 
 ```bash
@@ -106,6 +108,10 @@ Run one game with Codex:
   --effort max
 ```
 
+The program prints the run-directory location and scorecard ID, and saves
+observations and action logs. For this example, allow approximately 1.5-2 hours
+for agents to complete all levels in the game, depending on model-service response times.
+
 Run one game with Claude:
 
 ```bash
@@ -130,7 +136,7 @@ local game files are supplied through `ENVIRONMENTS_DIR`.
 
 ### GameWorld
 
-Prepare the GameWorld environment:
+Prepare the [GameWorld](https://github.com/gameworld-project/GameWorld) environment:
 
 ```bash
 ./scripts/env_setup/gameworld.sh
@@ -150,7 +156,7 @@ export GAMES_ROOT="$PWD/local/GameWorld-Games"
 
 ### AI GameStore
 
-Prepare the AI GameStore environment:
+Prepare the [AI GameStore](https://github.com/lance-ying/aigamestore) environment:
 
 ```bash
 ./scripts/env_setup/aigamestore.sh
@@ -168,7 +174,7 @@ export AIGAMESTORE_GAMES_ROOT="$PWD/local/aigamestore/games"
 
 ### BabyVision
 
-BabyVision answers questions about static images using `inspect` and `read_pixels`.
+[BabyVision](https://github.com/UniPat-AI/BabyVision) answers questions about static images using `inspect` and `read_pixels`.
 
 Download the dataset and install its dependencies:
 
