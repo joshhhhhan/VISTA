@@ -21,6 +21,7 @@ run_logs/
 recordings/
 environment_files/
 experiments/
+model_records/
 
 # Local editor/system files.
 .DS_Store

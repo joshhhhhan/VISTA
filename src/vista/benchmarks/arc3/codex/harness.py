@@ -26,6 +26,7 @@ from vista.backends.codex.lifecycle import (
     run_task_with_compact_checkpoints as run_task_with_compact_checkpoints,
     write_compact_restore_hook as write_compact_restore_hook,
 )
+from vista.backends.codex.provider import DEEPSEEK_CODEX_PROVIDER
 from vista.benchmarks.arc3.codex.controller import GameController, write_json
 from vista.benchmarks.arc3.codex.recovery import TASK_OBJECTIVE
 from vista.benchmarks.arc3.codex.runner import (
@@ -108,9 +109,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="online",
     )
     parser.add_argument(
+        "--provider",
+        choices=["openai", "deepseek"],
+        default="openai",
+        help="Codex model provider (default: openai)",
+    )
+    parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help="Codex model",
+        default=None,
+        help="Codex model (defaults to the selected provider's model)",
     )
     parser.add_argument("--effort", choices=CODEX_EFFORT_LEVELS)
     parser.add_argument("--timeout", type=int, default=300)
@@ -132,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.operation_mode != "offline" and not os.getenv("ARC_API_KEY"):
-        parser.error("ARC_API_KEY is not set. Put it in .env or export it.")
+        print("ARC_API_KEY is not set; using the ARC anonymous API key.")
     if args.max_steps < 1:
         parser.error("--max-steps must be >= 1")
     if args.timeout < 1:
@@ -164,11 +171,23 @@ def run_game(
         raise ValueError("shared_arc and shared_scorecard_id must be provided together")
 
     args = argparse.Namespace(**vars(args))
+    provider = (
+        DEEPSEEK_CODEX_PROVIDER
+        if getattr(args, "provider", "openai") == "deepseek"
+        else None
+    )
+    if args.model is None:
+        args.model = provider.model if provider is not None else DEFAULT_MODEL
     args.model, reasoning_effort = resolve_model_spec(
         args.model,
         getattr(args, "effort", None),
     )
-    compact_thresholds = resolve_compact_thresholds(args.model)
+    compact_thresholds = resolve_compact_thresholds(
+        args.model,
+        model_catalog=(
+            provider.model_catalog_json if provider is not None else None
+        ),
+    )
     if run_dir is None:
         run_dir = create_run_dir(getattr(args, "runs_dir", Path("runs")))
     else:
@@ -188,6 +207,7 @@ def run_game(
     ):
         directory.mkdir(parents=True, exist_ok=True)
     private_dir.chmod(0o700)
+    (visible_dir / ".codex").mkdir()
 
     write_player_agents(
         Path(__file__).with_name("prompt.md"),
@@ -195,7 +215,10 @@ def run_game(
         describe_changes=args.describe_changes,
     )
     write_guide(visible_dir / "GUIDE.md", current_model=EMPTY_GUIDE_MODEL)
-    codex_home = prepare_codex_home(private_dir / "codex_home")
+    codex_home = prepare_codex_home(
+        private_dir / "codex_home",
+        auth_link_required=provider is None,
+    )
     write_compact_restore_hook(visible_dir, codex_home)
 
     manifest = base_manifest(
@@ -217,9 +240,16 @@ def run_game(
     failure: BaseException | None = None
 
     try:
-        auth_file = validate_codex_auth_file(
-            auth_file if auth_file is not None else default_codex_auth_file()
-        )
+        if provider is None:
+            auth_file = validate_codex_auth_file(
+                auth_file if auth_file is not None else default_codex_auth_file()
+            )
+        else:
+            auth_file = None
+            if not os.getenv(provider.env_key):
+                raise RuntimeError(
+                    f"{provider.env_key} is not set for the {provider.name} provider"
+                )
         if arc is None:
             os.environ["OPERATION_MODE"] = args.operation_mode
             arc = Arcade(
@@ -280,6 +310,7 @@ def run_game(
             controller,
             reasoning_effort,
             compact_thresholds,
+            provider=provider,
         )
 
         run_task_with_compact_checkpoints(
@@ -363,11 +394,13 @@ def build_runner(
     args: argparse.Namespace,
     visible_dir: Path,
     codex_home: Path,
-    auth_file: Path,
+    auth_file: Path | None,
     io_dir: Path,
     controller: GameController,
     reasoning_effort: str | None,
     compact_thresholds: CompactThresholds,
+    *,
+    provider: Any | None = None,
 ) -> DockerCodexRunner:
     maximum_calls = args.max_steps * (args.max_invalid_retries + 1) + 1
     return DockerCodexRunner(
@@ -379,6 +412,7 @@ def build_runner(
         codex_bin=default_native_codex_bin(),
         model=args.model,
         reasoning_effort=reasoning_effort,
+        provider=provider,
         compact_thresholds=compact_thresholds,
         task_timeout=bounded_task_timeout(args.timeout, maximum_calls),
         display_size=DISPLAY_SIZE,

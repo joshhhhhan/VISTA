@@ -1,0 +1,36 @@
+{
+  "name": "VISTA (linux/amd64)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    "--platform=linux/amd64"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/VISTA-main,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/VISTA-main",
+  "remoteUser": "root",
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/VISTA-main && python -m venv /opt/vista-venv && /opt/vista-venv/bin/pip install --upgrade pip && /opt/vista-venv/bin/pip install -e .",
+  "forwardPorts": [
+    8765
+  ],
+  "shutdownAction": "stopContainer",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/vista-venv/bin/python",
+        "python.analysis.extraPaths": [
+          "/workspaces/VISTA-main/src"
+        ],
+        "terminal.integrated.cwd": "/workspaces/VISTA-main",
+        "files.watcherExclude": {
+          "**/runs/**": true,
+          "**/.venv/**": true
+        }
+      }
+    }
+  }
+}

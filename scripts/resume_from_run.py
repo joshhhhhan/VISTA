@@ -14,13 +14,13 @@ import shutil
 from pathlib import Path
 
 from arc_agi import Arcade, OperationMode
-from arcengine import GameAction
 
 from vista.backends.claude.lifecycle import run_task_with_native_context
 from vista.backends.claude.provider import DEEPSEEK_PROVIDER
 from vista.backends.claude.runner import claude_version, prepare_claude_config
 from vista.benchmarks.arc3.claude import harness
 from vista.benchmarks.arc3.claude.controller import (
+    ACTION_BY_NAME,
     GameController,
     render_observation_frames,
     write_json,
@@ -140,7 +140,11 @@ def main() -> int:
     if obs is None:
         raise RuntimeError("The local environment returned no initial observation.")
     for turn, (name, data) in enumerate(actions, start=1):
-        action = getattr(GameAction, name)
+        action = ACTION_BY_NAME.get(name)
+        if action is None:
+            raise RuntimeError(
+                f"Previous run action {turn} is not a known game action: {name!r}"
+            )
         obs = env.step(action, data=data)
         if obs is None:
             raise RuntimeError(f"Replay failed at action {turn} ({name}).")
@@ -246,7 +250,8 @@ def main() -> int:
     prompt = "\n".join(
         [
             "You are resuming an in-progress ARC-AGI-3 game.",
-            "The game is already at 7 of 8 levels completed. Do not restart or reset it.",
+            f"The game is already at {obs.levels_completed} of {obs.win_levels} "
+            "levels completed. Do not restart or reset it.",
             "Continue from the current observation and finish the remaining level.",
             "The previous player's GUIDE.md and WORKING.md are restored in the workspace.",
             "",

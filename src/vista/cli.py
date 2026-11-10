@@ -17,7 +17,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("arc3", "gameworld", "aigamestore", "babyvision"),
         required=True,
     )
-    parser.add_argument("--backend", choices=("codex", "claude"), required=True)
+    parser.add_argument(
+        "--backend", choices=("codex", "claude", "dsh"), required=True
+    )
     if not arguments or arguments in (["--help"], ["-h"]):
         parser.print_help()
         return 0

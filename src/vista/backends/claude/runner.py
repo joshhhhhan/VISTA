@@ -43,6 +43,7 @@ PLAYER_IMAGE = "arc3-claude-player:0.1"
 CONTAINER_CLAUDE_BIN = "/opt/claude/claude"
 CONTAINER_MCP_BRIDGE = "/opt/arc3/claude_mcp_bridge.py"
 CONTAINER_COMPACT_HOOK = "/opt/arc3/claude_compact_hook.py"
+CONTAINER_GAME_SOCKET = "/run/arc3-game"
 PINNED_CLAUDE_VERSION = "2.1.220"
 DEFAULT_PINNED_CLAUDE_BIN = (
     Path.home() / ".local" / "share" / "claude" / "versions" / PINNED_CLAUDE_VERSION
@@ -181,6 +182,10 @@ def credential_free_environment(
 
 
 def claude_version(binary: Path | None = None) -> str:
+    # A foreign-architecture binary is validated inside the player container.
+    override = os.getenv("ARC3_CLAUDE_VERSION_OVERRIDE", "").strip()
+    if override:
+        return override
     executable = (binary or default_claude_bin()).resolve()
     result = subprocess.run(
         [str(executable), "--version"],
@@ -270,7 +275,7 @@ def prepare_claude_config(target: Path) -> Path:
 def create_short_socket_dir(segment: int) -> Path:
     """Create a private host path that stays below the AF_UNIX path limit."""
 
-    directory = Path(tempfile.mkdtemp(prefix=f"arc3-claude-{segment:03d}-"))
+    directory = Path(tempfile.mkdtemp(prefix=f"a{segment:03d}-"))
     directory.chmod(0o700)
     socket_path = directory / "controller.sock"
     if len(os.fsencode(socket_path)) >= 100:
@@ -335,7 +340,12 @@ class ClaudeCodeRunner:
         )
         self.claude_bin = (claude_bin or default_claude_bin()).resolve()
         self.ca_bundle = (
-            ca_bundle or Path("/etc/ssl/certs/ca-certificates.crt")
+            ca_bundle
+            or (
+                Path(os.environ["SSL_CERT_FILE"])
+                if os.environ.get("SSL_CERT_FILE")
+                else Path("/etc/ssl/certs/ca-certificates.crt")
+            )
         ).resolve()
         if effort not in CLAUDE_EFFORT_LEVELS:
             raise ValueError(
@@ -709,6 +719,11 @@ class ClaudeCodeRunner:
 
         try:
             host.start()
+            settle_seconds = os.getenv(
+                "VISTA_DOCKER_SOCKET_SETTLE_SECONDS", ""
+            ).strip()
+            if settle_seconds and not self.host_runtime:
+                time.sleep(float(settle_seconds))
             process = subprocess.Popen(
                 command,
                 cwd=self.host_workspace if self.host_runtime else self.visible_dir,
@@ -1078,7 +1093,7 @@ class ClaudeCodeRunner:
             socket = str(socket_path)
         else:
             bridge = CONTAINER_MCP_BRIDGE
-            socket = "/run/arc3-game/controller.sock"
+            socket = CONTAINER_GAME_SOCKET
         path.write_text(
             json.dumps(
                 {
@@ -1196,7 +1211,8 @@ class ClaudeCodeRunner:
         disable_slash_commands: bool = True,
     ) -> list[str]:
         uid = str(os.getuid())
-        gid = str(os.getgid())
+        socket_gid = os.getenv("VISTA_DOCKER_SOCKET_GID", "").strip()
+        gid = socket_gid if socket_gid.isdigit() else str(os.getgid())
         bridge = Path(__file__).with_name("mcp_bridge.py").resolve()
         compact_hook = Path(__file__).with_name("compact_hook.py").resolve()
         allowed_tools = ",".join(
@@ -1272,7 +1288,7 @@ class ClaudeCodeRunner:
             "-v",
             f"{self.io_dir}:/claude-io:rw",
             "-v",
-            f"{socket_dir}:/run/arc3-game:rw",
+            f"{socket_dir / 'controller.sock'}:{CONTAINER_GAME_SOCKET}:rw",
             "-w",
             "/workspace",
             self.image,

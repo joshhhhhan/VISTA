@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -17,6 +18,8 @@ from typing import Any
 from vista.core.dispatcher import GameToolDispatcher, ToolExecution
 from vista.core.player import RecoveryPrompts, ToolInterface
 from vista.core.session import CompactRecovery, RetryRecovery, RuntimeRecovery
+
+from .provider import CodexProvider
 
 CONTAINER_CODEX_BIN = "/opt/codex/bin/codex"
 PLAYER_IMAGE = "arc3-codex-player:0.1"
@@ -185,6 +188,10 @@ def default_codex_bin() -> Path:
             "--omit=dev --no-audit --no-fund @openai/codex@0.145.0"
         )
     resolved = candidate.resolve()
+    # Route A runs a linux/amd64 Codex binary on a macOS host.  The host cannot
+    # execute it for a version probe; the container validates the mounted binary.
+    if os.getenv("ARC3_CODEX_VERSION_OVERRIDE", "").strip():
+        return resolved
     completed = subprocess.run(
         [str(resolved), "--version"],
         text=True,
@@ -239,7 +246,7 @@ def default_ca_bundle() -> Path:
     raise FileNotFoundError("Could not find a host CA bundle; set SSL_CERT_FILE")
 
 
-def prepare_codex_home(target: Path) -> Path:
+def prepare_codex_home(target: Path, *, auth_link_required: bool = True) -> Path:
     """Create writable per-run state without copying credentials."""
     target.mkdir(parents=True, exist_ok=True)
     target.chmod(0o700)
@@ -249,6 +256,10 @@ def prepare_codex_home(target: Path) -> Path:
         child.chmod(0o700)
 
     auth_link = target / "auth.json"
+    if not auth_link_required:
+        if auth_link.exists() or auth_link.is_symlink():
+            auth_link.unlink()
+        return target
     if not auth_link.exists() and not auth_link.is_symlink():
         auth_link.symlink_to("/run/codex-auth.json")
     elif not auth_link.is_symlink() or os.readlink(auth_link) != "/run/codex-auth.json":
@@ -263,17 +274,51 @@ def write_codex_config(
     normal_auto_compact_limit: int | None = NORMAL_AUTO_COMPACT_LIMIT,
     *,
     checkpoint_hooks: bool = True,
+    model: str | None = None,
+    provider: CodexProvider | None = None,
 ) -> Path:
     """Write the complete player-local Codex configuration."""
     instructions = codex_home / Path(PLAYER_BASE_INSTRUCTIONS_PATH).name
     instructions.write_text(PLAYER_BASE_INSTRUCTIONS, encoding="utf-8")
     instructions.chmod(0o600)
 
+    model_lines: list[str] = []
+    if model:
+        model_lines.append(f"model = {json.dumps(model)}")
+    if provider:
+        model_lines.append(f"model_provider = {json.dumps(provider.name)}")
+        if provider.model_context_window is not None:
+            model_lines.append(
+                f"model_context_window = {provider.model_context_window}"
+            )
+        if provider.model_catalog_json is not None:
+            catalog_source = provider.model_catalog_json.expanduser()
+            if catalog_source.is_file():
+                catalog_target = codex_home / catalog_source.name
+                shutil.copy2(catalog_source, catalog_target)
+                catalog_target.chmod(0o600)
+                model_lines.append(
+                    "model_catalog_json = "
+                    + json.dumps(f"/codex-home/{catalog_target.name}")
+                )
+
+    provider_lines: list[str] = []
+    if provider:
+        provider_lines = [
+            "",
+            f"[model_providers.{provider.name}]",
+            f"name = {json.dumps(provider.name)}",
+            f"base_url = {json.dumps(provider.base_url)}",
+            f"wire_api = {json.dumps(provider.wire_api)}",
+            f"env_key = {json.dumps(provider.env_key)}",
+        ]
+
     config = codex_home / "config.toml"
     config.write_text(
         "\n".join(
             [
                 f'model_instructions_file = "{PLAYER_BASE_INSTRUCTIONS_PATH}"',
+                *model_lines,
                 *(
                     [
                         f"model_auto_compact_token_limit = {normal_auto_compact_limit}",
@@ -316,6 +361,7 @@ def write_codex_config(
                 "[features.code_mode]",
                 "enabled = false",
                 f'direct_only_tool_namespaces = ["{PLAYER_TOOL_NAMESPACE}"]',
+                *provider_lines,
                 "",
             ]
         ),
@@ -444,13 +490,14 @@ class DockerCodexRunner:
         *,
         visible_dir: Path,
         codex_home: Path,
-        auth_file: Path,
+        auth_file: Path | None = None,
         io_dir: Path,
         controller: Any,
         codex_bin: Path | None = None,
         ca_bundle: Path | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        provider: CodexProvider | None = None,
         compact_thresholds: CompactThresholds | None = None,
         task_timeout: int = 3600,
         image: str = PLAYER_IMAGE,
@@ -470,7 +517,10 @@ class DockerCodexRunner:
         self.screenshots_dir = self.visible_dir / "screenshots"
         self.codex_project_dir = self.visible_dir / ".codex"
         self.codex_home = codex_home.resolve()
-        self.auth_file = validate_codex_auth_file(auth_file)
+        self.auth_file = (
+            validate_codex_auth_file(auth_file) if auth_file is not None else None
+        )
+        self.provider = provider
         self.io_dir = io_dir.resolve()
         self.exchange_dir = self.io_dir / "exchange"
         self.controller = controller
@@ -642,6 +692,8 @@ class DockerCodexRunner:
             self.codex_home,
             None if self.native_compaction else compact_limit,
             checkpoint_hooks=not self.native_compaction,
+            model=self.model,
+            provider=self.provider,
         )
 
     def _next_segment(self) -> int:
@@ -911,8 +963,16 @@ class DockerCodexRunner:
             f"{self.ca_bundle}:/etc/ssl/certs/ca-certificates.crt:ro",
             "-v",
             f"{self.codex_home}:/codex-home:rw",
-            "-v",
-            f"{self.auth_file}:/run/codex-auth.json:ro",
+            *(
+                ("-v", f"{self.auth_file}:/run/codex-auth.json:ro")
+                if self.auth_file is not None
+                else ()
+            ),
+            *(
+                ("-e", self.provider.env_key)
+                if self.provider is not None
+                else ()
+            ),
             "-v",
             f"{self.codex_project_dir}:/workspace/.codex:ro",
             "-w",
